@@ -1,0 +1,1321 @@
+No gradle/SDK locally. adb exists. So I can't build. I'll produce a project buildable in Android Studio. I need to be accurate.
+
+Let me write the files. I'll put it under android/ at repo root? The repo is the openwa project. Creating a new top-level android/ is fine and clearly separate. But maybe user wants it in the same repo. Yes.
+
+Wait — they might prefer the app to be a thin client of OpenWA (no porting). But "fully local apk no external app or file needed" strongly implies standalone. I'll implement standalone WebView and mention that the other option (thin client to OpenWA) is trivial. Actually — "no external app of file needed" might mean they don't want the APK to depend on the OpenWA server running. So standalone it is.
+
+Now let me create files:
+
+1. android/settings.gradle.kts
+2. android/build.gradle.kts
+3. android/gradle.properties
+4. android/gradle/wrapper/gradle-wrapper.properties
+5. android/app/build.gradle.kts
+6. android/app/src/main/AndroidManifest.xml
+7. android/app/src/main/java/app/waweb/local/MainActivity.kt
+8. android/app/src/main/java/app/waweb/local/Incoming.kt? Keep in one file.
+9. android/app/src/main/assets/wa_boot.js
+10. android/app/src/main/assets/wa_utils.js — copy of node_modules whatsapp-web.js Utils.js wrapped. I can generate it via a script (bash cp + prepend/append). Since it's 1800 lines, use bash to build it.
+11. android/README.md? They said no docs, but a README helps build. The rule says don't proactively create docs. But a build README for a scaffold is arguably necessary. I'll skip README and explain in chat. Hmm, but they'll need build instructions. I'll put it in the chat response instead.
+
+Also proguard-rules.pro not needed.
+
+Let me think about the wrapper. Without gradle-wrapper.jar, ./gradlew won't work. Android Studio can sync without wrapper? It uses the wrapper. I can include gradle/wrapper/gradle-wrapper.properties but no jar → ./gradlew fails. Option: don't include wrapper; tell them "Open the android/ folder in Android Studio, it will generate the wrapper / use bundled Gradle." Android Studio uses its own Gradle distribution specified via wrapper properties; if jar missing, Studio may complain. Better to generate wrapper jar. Can I download gradle-wrapper.jar? I could fetch from services.gradle.org? The wrapper jar is available in Gradle distributions. Could use curl to download gradle 8.7 zip and extract, but that's 130MB and network. Or use the wrapper jar from a known URL (e.g., GitHub raw from gradle/gradle). Simpler: instruct to install via Android Studio.
+
+Actually, I can generate a wrapper by downloading just the wrapper jar from Maven Central: org.gradle:gradle-wrapper? Not a published artifact. There's gradle/gradle repo gradle/wrapper/gradle-wrapper.jar. We could curl raw GitHub. But maybe network is available. Let me test quickly with a HEAD to services.gradle.org? Might be heavy. I'll skip and tell them Android Studio handles it; or they run gradle wrapper if gradle installed.
+
+Hmm, "fully local apk no external app or file needed" — maybe they'll build with their own tooling. Fine.
+
+Now the Kotlin code. Let me be careful with APIs.
+
+package app.waweb.local
+
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Context
+import android.content.SharedPreferences
+import android.os.Bundle
+import android.util.Log
+import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import org.json.JSONObject
+import java.util.concurrent.Executors
+
+WebView layout params: use ViewGroup.LayoutParams.MATCH_PARENT.
+
+We can't call setContentView(web, params) with plain Activity? Actually Activity.setContentView(View, LayoutParams) exists. Yes.
+
+WebViewClient.onPageFinished signature: override fun onPageFinished(view: WebView?, url: String?) — in Kotlin with newer SDK, params are non-null? The Java signature is public void onPageFinished(WebView view, String url). With AndroidX/core nullability annotations it's WebView!, String!. Overriding with non-null WebView, String compiles (platform types). Use view: WebView? to be safe? Override must match; Kotlin allows nullable. I'll use nullable and handle.
+
+Similarly shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?).
+
+For file chooser: implement onShowFileChooser and startActivityForResult. That requires activity result handling. I'll include it to support attachments. Keep simple with ActivityResultLauncher? Plain Activity has startActivityForResult. Let me include minimal.
+
+Actually, skip file chooser to keep it compiling and focused; mention it in comments. But "same" functionality includes media sending? The user asked "interact with my whatsapp web" primarily. Text + receive is core. I'll add file chooser as a TODO comment. Hmm, better to include it; it's not too bad. But risk of compile errors. I'll include a straightforward version.
+
+Let me write:
+
+private var filePathCallback: ValueCallback<Array<Uri>>? = null
+private val FILE_REQ = 1001
+
+web.webChromeClient = object : WebChromeClient() {
+    override fun onShowFileChooser(
+        webView: WebView?,
+        callback: ValueCallback<Array<Uri>>?,
+        params: FileChooserParams?
+    ): Boolean {
+        filePathCallback?.onReceiveValue(null)
+        filePathCallback = callback
+        return try {
+            startActivityForResult(params!!.createIntent(), FILE_REQ)
+            true
+        } catch (e: Exception) {
+            filePathCallback = null
+            false
+        }
+    }
+}
+
+override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+    if (requestCode == FILE_REQ) {
+        val cb = filePathCallback ?: return
+        filePathCallback = null
+        cb.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data))
+    } else super.onActivityResult(requestCode, resultCode, data)
+}
+
+Good.
+
+JS bridge:
+inner class Bridge {
+    @JavascriptInterface
+    fun onMessage(json: String) {
+        io.execute {
+            try {
+                val m = JSONObject(json)
+                handleIncoming(m)
+            } catch (e: Exception) { Log.e(TAG, "onMessage", e) }
+        }
+    }
+    @JavascriptInterface
+    fun onState(json: String) { Log.d(TAG, "state $json") }
+    @JavascriptInterface
+    fun log(msg: String) { Log.d("WAJS", msg) }
+}
+
+handleIncoming:
+private fun handleIncoming(m: JSONObject) {
+    val idObj = m.optJSONObject("id") ?: return
+    val id = idObj.optString("_serialized").ifEmpty { idObj.optString("\$1") }
+    val fromMe = idObj.optBoolean("fromMe")
+    val chatId = idObj.optString("remote")
+    val type = m.optString("type")
+    val body = m.optString("body")
+    val timestamp = m.optLong("timestamp")
+    if (fromMe || id.isEmpty()) return
+    if (store.seen(id)) return
+    store.markSeen(id)
+    if (type != "chat") {  // only text for the demo
+        // allow image captions? skip
+        return
+    }
+    Log.d(TAG, "incoming $chatId: $body")
+    onText(chatId, body, id)
+}
+
+onText demo:
+private fun onText(chatId: String, body: String, msgId: String) {
+    if (!body.trim().equals("!ping", true)) return
+    sendText(chatId, "pong")
+}
+
+sendText:
+private fun sendText(chatId: String, text: String) {
+    val js = "window.__waSend(${JSONObject.quote(chatId)}, ${JSONObject.quote(text)}, null)"
+    runOnUiThread { web.evaluateJavascript(js) { r -> Log.d(TAG, "send result $r") } }
+}
+
+Seen store: SharedPreferences with a bounded set. Simple: store a JSON array? Or a String set of last 500. Use getStringSet? Adding requires copy. Fine.
+
+class SeenStore(ctx: Context) {
+    private val prefs = ctx.getSharedPreferences("wa_seen", Context.MODE_PRIVATE)
+    @Synchronized fun seen(id: String) = prefs.getStringSet("ids", emptySet())!!.contains(id)
+    @Synchronized fun markSeen(id: String) {
+        val cur = prefs.getStringSet("ids", emptySet())!!.toMutableSet()
+        cur.add(id)
+        while (cur.size > 800) { cur.remove(cur.first()) } // not ordered
+        prefs.edit().putStringSet("ids", cur).apply()
+    }
+}
+Set isn't ordered; remove arbitrary is fine. But HashSet order arbitrary; okay.
+
+Better keep an ArrayList in one JSON string to trim oldest. Simpler with Set is fine.
+
+Now the boot JS. Let me write it robustly.
+
+(function () {
+  if (window.__waBooted) return;
+  window.__waBooted = true;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const log = (...a) => { try { AndroidWA.log(a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')); } catch (e) {} };
+  const emit = (fn, obj) => { try { AndroidWA[fn](JSON.stringify(obj)); } catch (e) {} };
+
+  async function waitFor(pred, tries, ms) {
+    for (let i = 0; i < tries; i++) {
+      try { if (pred()) return true; } catch (e) {}
+      await sleep(ms);
+    }
+    return false;
+  }
+
+  async function main() {
+    log('boot: waiting for module loader');
+    const ok = await waitFor(() => typeof window.require === 'function', 240, 500);
+    if (!ok) { log('boot: window.require never appeared (WhatsApp Web changed)'); return; }
+
+    // LoadUtils defines window.WWebJS.* — the exact injected helpers whatsapp-web.js uses.
+    if (typeof window.WWebJS === 'undefined') {
+      try { window.__loadWWebUtils(); } catch (e) { log('LoadUtils failed: ' + e); }
+    }
+    if (typeof window.WWebJS === 'undefined') { log('boot: WWebJS missing after LoadUtils'); return; }
+    log('boot: WWebJS ready');
+
+    // Send helper callable from Kotlin.
+    window.__waSend = async function (chatId, text, quotedId) {
+      const chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+      if (!chat) throw new Error('chat not found: ' + chatId);
+      const opts = quotedId ? { quotedMessageId: quotedId } : {};
+      let content = text;
+      if (text && typeof text === 'object') content = text; // media payload
+      const sent = await window.WWebJS.sendMessage(chat, content, opts);
+      return sent ? window.WWebJS.getMessageModel(sent) : null;
+    };
+
+    // Incoming messages: hook the same collection whatsapp-web.js hooks.
+    let Msg;
+    const gotMsg = await waitFor(() => {
+      Msg = window.require('WAWebCollections').Msg;
+      return !!Msg && typeof Msg.on === 'function';
+    }, 120, 500);
+    if (!gotMsg) { log('boot: Msg collection unavailable'); return; }
+
+    Msg.on('add', function (msg) {
+      try {
+        if (!msg.isNewMsg) return;
+        if (msg.type === 'ciphertext') {
+          msg.once('change:type', function (m) {
+            try { emit('onMessage', window.WWebJS.getMessageModel(m)); } catch (e) {}
+          });
+          return;
+        }
+        emit('onMessage', window.WWebJS.getMessageModel(msg));
+      } catch (e) { log('msg hook error: ' + e); }
+    });
+
+    const state = window.require('WAWebSocketModel').Socket;
+    if (state && typeof state.on === 'function') {
+      state.on('change:state', function (_s, s) { emit('onState', { state: s }); });
+      emit('onState', { state: state.state });
+    }
+    log('boot: listening');
+  }
+
+  main();
+})();
+
+Note: window.__loadWWebUtils must be defined by wa_utils.js, and asset scripts must be injected in order: first wa_utils.js (defines __loadWWebUtils), then wa_boot.js. But wa_utils.js needs window.require? No — defining __loadWWebUtils just wraps and defines LoadUtils; calling it later. So inject utils first, then boot. Good. Actually wa_utils.js can define the function without calling. Let me make the wrapper:
+
+;(function () {
+  if (window.__loadWWebUtils) return;
+  window.__loadWWebUtils = function () {
+    if (typeof window.WWebJS !== 'undefined') return;
+    const exports = {};
+    // ... original Utils.js contents ...
+    exports.LoadUtils();
+  };
+})();
+
+But the original content uses exports.LoadUtils = () => {...}. If I paste it inside the function, exports is local. Good. However, the original file has 'use strict'; at top. Pasting into function is fine, but the leading 'use strict' becomes a directive only if it's the first statement of the function body — here it appears after const exports = {};, so it's just a string expression, harmless. Actually I'll strip the first 'use strict'; line when generating.
+
+Also the original uses exports but not module. Good.
+
+One issue: exports.LoadUtils = () => {...} — the arrow function body is the entire 1800 lines? Let me check the structure: line 1 'use strict'; line 3 exports.LoadUtils = () => { and the closing at end. So it's one big arrow function. Pasting works.
+
+Generation via bash:
+SRC=node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+{ echo ';(function () {'; echo '  if (window.__loadWWebUtils) return;'; echo '  window.__loadWWebUtils = function () {'; echo '    if (typeof window.WWebJS !== "undefined") return;'; echo '    const exports = {};'; echo '    /* ===== whatsapp-web.js src/util/Injected/Utils.js (MIT) ===== */'; sed "1{/^'use strict';$/d;}" "$SRC"; echo '    exports.LoadUtils();'; echo '    /* ===== end ===== */'; echo '  };'; echo '})();'; } > android/app/src/main/assets/wa_utils.js
+
+Wait: sed "1{/^'use strict';$/d;}" deletes line 1 only if matches. Good.
+
+But careful: the file contains /* ... */ comments with */? fine.
+
+Also exports.LoadUtils = () => { ... }; then we call exports.LoadUtils();. Good.
+
+Do we need to also inject AuthStore? No — authentication is the real WhatsApp web app's own; whatsapp-web.js's ExposeAuthStore is only to read the auth state for its LocalAuth strategy. In WebView we don't need it; cookies/IndexedDB persist the session. But wait — whatsapp-web.js uses AuthStore to save the session data to disk. In WebView, the system persists cookies/localStorage/IndexedDB if we enable DOM storage and use a persistent profile (default WebView does persist). So no need.
+
+Critical: WebView's storage persistence. By default WebView persists cookies and DOM storage for the app's data directory across restarts. Ensure domStorageEnabled and databaseEnabled. Also IndexedDB is part of DOM storage (WebView supports it). Good. CookieManager.flush() on pause.
+
+But there's a known caveat: WebView with setAcceptThirdPartyCookies and storage is persisted, but web.whatsapp.com may detect WebView and block? The user agent contains ; wv which WhatsApp may treat differently. Strip ; wv and the Version/4.0 token to look like Chrome. I included .replace("; wv", ""). Also maybe remove Version/4.0  part. Let me do .replace("; wv", "").replace("Version/4.0 ", "").
+
+Also set web.settings.setSupportMultipleWindows(false) default. Fine.
+
+Do we need android:hardwareAccelerated="true"? Default true.
+
+Now, one more nuance: evaluateJavascript must run in page's main frame. Fine.
+
+Another nuance: The script injected at onPageFinished may run before the app's webpack runtime exposes window.require; our polling handles it (up to 2 min). But if the page reloads after QR login, our __waBooted flag resets with the new document, and onPageFinished fires again → re-inject. Good, as long as we inject on every onPageFinished (not guard in Kotlin). I'll inject every onPageFinished for web.whatsapp.com, and JS guard prevents double-hooking in same document.
+
+However, injecting wa_boot.js again calls window.__loadWWebUtils (defined in prior document? No, new document → undefined) so we must inject wa_utils.js then wa_boot.js every time. Do both. Since JS guard is per document, fine.
+
+Implementation of injecting two assets sequentially: read both and evaluate utils first, then boot in the callback. evaluateJavascript(utils, null) then evaluateJavascript(boot, null) — callback not guaranteed ordering? They're queued in order on the UI thread; but to be safe, evaluate boot in the callback of utils.
+
+web.evaluateJavascript(utilsJs) { web.evaluateJavascript(bootJs, null) }
+
+Good.
+
+Also, onPageFinished may fire multiple times for subframes? It fires for main frame only (onPageFinished is main frame). But also for iframes? No.
+
+Now, is window.require really named require? In whatsapp-web.js it is window.require. Confirmed by code. Good.
+
+Now about msg.type === 'ciphertext' handling: msg.once('change:type', ...). Good.
+
+Potential issue: getMessageModel calls findLinks(message.mediaObject ? message.caption : message.body) — if body undefined, findLinks may throw; but whatsapp-web.js uses it, so it's fine for text/media.
+
+Now, the Kotlin parse: idObj.optString("remote") — getMessageModel converts id.remote to a string _serialized. But does serialize() include id as an object with remote? In whatsapp-web.js Message model, msg.id has remote string after normalization. Yes, they do msg.id = Object.assign({}, msg.id, { remote: msg.id.remote._serialized || msg.id.remote.$1 }). Good.
+
+msg.from is a string _serialized? message.serialize() likely returns from, to as strings. So use m.optString("from") as sender and chatId = idObj.optString("remote").
+
+For groups, idObj.remote ends with @g.us. We can skip groups by default.
+
+Now, timestamp field: the model may have t (seconds) and timestamp (ms?). whatsapp-web.js Message has timestamp (unix seconds) and t. Use m.optLong("timestamp").
+
+Now, sending: We want to reply to the exact chat. window.__waSend(chatId, text, quotedId). Quoting requires the message to be in Msg store; if not found it throws unless ignoreQuoteErrors. Since we pass the just-received id, it should be there. But to be safe, wrap: if quoted fails, send without quote. Actually the helper throws; handle in JS:
+
+window.__waSend = async function(chatId, text, quotedId) {
+  const chat = await window.WWebJS.getChat(chatId, {getAsModel:false});
+  if (!chat) throw new Error(...);
+  try {
+    const sent = await window.WWebJS.sendMessage(chat, text, quotedId ? { quotedMessageId: quotedId } : {});
+    return sent ? window.WWebJS.getMessageModel(sent) : null;
+  } catch (e) {
+    if (quotedId) {
+      const sent = await window.WWebJS.sendMessage(chat, text, {});
+      return sent ? window.WWebJS.getMessageModel(sent) : null;
+    }
+    throw e;
+  }
+};
+
+evaluateJavascript returns a Promise; evaluateJavascript doesn't await promises; the callback gets the stringified return which for a Promise is {} or null. So the send result logged in Kotlin won't be meaningful. That's okay. To report success/failure, the JS could call AndroidWA.onSent(...) or AndroidWA.onError(...). Let me add AndroidWA.onSent/AndroidWA.onError and have __waSend call them. Better:
+
+window.__waSend = async function(chatId, text, quotedId) {
+  try { ... AndroidWA.onSent(JSON.stringify({chatId})); }
+  catch(e) { AndroidWA.onError(JSON.stringify({chatId, error: String(e)})); }
+};
+
+Good.
+
+Now, onState in Kotlin: log; maybe notify UI. Fine.
+
+Now the AI integration. I'll add an interface in Kotlin:
+
+private fun onText(chatId: String, body: String, msgId: String) {
+    // This is where you plug your LLM. Examples:
+    //   - POST to OpenAI/Anthropic with `body`
+    //   - call a local llama.cpp binding
+    //   - run the same "opencode run" logic against a remote server
+    if (body.trim().equals("!ping", ignoreCase = true)) {
+        sendText(chatId, "pong")
+    }
+}
+
+And a commented example using HttpURLConnection. Maybe include a real reply() using OpenAI-compatible endpoint with a config constant. That might be overkill and requires API key handling. I'll include a small Llm.reply(body): String? using HttpURLConnection to an OpenAI-compatible /chat/completions, with constants at top, disabled by default (API_KEY empty → null). That teaches the "AI" part. Good idea. But adding network on a background thread — io executor already. Implement synchronous HttpURLConnection. Keep concise.
+
+Actually, the user's bridge uses opencode run locally; on Android there's no opencode. They'd use an API or on-device model. I'll implement generic HTTP to an OpenAI-compatible endpoint (works with OpenAI, Groq, Ollama on LAN, OpenRouter). Use JSONObject to build request. That's good teaching.
+
+Let me write Llm.kt:
+
+object Llm {
+    // Point this at any OpenAI-compatible endpoint (OpenAI, Groq, OpenRouter, Ollama: http://10.0.2.2:11434/v1).
+    private const val BASE_URL = "https://api.openai.com/v1/chat/completions"
+    private const val MODEL = "gpt-4o-mini"
+    private const val API_KEY = "" // set to enable; empty = no auto-reply
+
+    fun isEnabled() = API_KEY.isNotBlank()
+
+    fun reply(history: List<Pair<String,String>>, userText: String): String? {
+        if (!isEnabled()) return null
+        ...
+    }
+}
+
+HttpURLConnection with 60s timeout, POST JSON, parse choices[0].message.content.
+
+Kotlin code with java.net.URL, HttpsURLConnection. Response read. Keep it straightforward.
+
+System prompt: "You are replying to WhatsApp messages. Be concise, plain text."
+
+Per-chat history: pass last N messages? We only get one at a time. Keep simple: single-turn with a system prompt. Teaching enough.
+
+I think that's a nice complete answer.
+
+Now let me also consider: WhatsApp may block WebView UA or require Chrome. Additional header X-Requested-With? Not needed. Some report web.whatsapp.com works in WebView. Fine.
+
+Alternative: Use Chrome Custom Tabs? No, can't inject. WebView is the way.
+
+Let me also mention a much more robust alternative: GeckoView? No.
+
+Now create the files. Let me write them.
+
+Also, I must ensure the android/ dir is not accidentally inside .gitignore weirdness. Fine.
+
+Let me write all files with the write tool.
+
+First, check if android exists.
+$ ls -d android 2>/dev/null || echo "no android dir"
+no android dir
+Thought: 162ms
+Let me create the scaffold. I'll write files one by one.
+# Wrote android/settings.gradle.kts
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "waweb-local"
+include(":app")
+
+# Wrote android/build.gradle.kts
+plugins {
+    id("com.android.application") version "8.7.3" apply false
+    id("org.jetbrains.kotlin.android") version "2.1.0" apply false
+}
+
+# Wrote android/gradle.properties
+org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+android.useAndroidX=true
+kotlin.code.style=official
+
+# Wrote android/gradle/wrapper/gradle-wrapper.properties
+distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\://services.gradle.org/distributions/gradle-8.9-bin.zip
+networkTimeout=10000
+validateDistributionUrl=true
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+
+# Wrote android/app/build.gradle.kts
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "app.waweb.local"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = "app.waweb.local"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+# Wrote android/app/src/main/AndroidManifest.xml
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <application
+        android:allowBackup="true"
+        android:hardwareAccelerated="true"
+        android:label="WA Local"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
+            android:exported="true"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
+
+Thought: 9.4s
+Now MainActivity.kt. Let me write it carefully with no androidx deps.
+
+I'll include:
+- WebView setup
+- JS bridge
+- SeenStore inner class
+- Llm call
+- file chooser
+- lifecycle persistence
+
+Let me write Llm in same file or separate. Separate file Llm.kt but same package. Fine.
+
+Careful with Kotlin nullability for WebViewClient override. Use:
+
+override fun onPageFinished(view: WebView?, url: String?) {
+    super.onPageFinished(view, url)
+    ...
+}
+
+Is onPageFinished in WebViewClient declared public void onPageFinished(WebView view, String url); overriding with nullable params in Kotlin is allowed? Kotlin override signature must match the platform type. Platform type WebView! can be overridden with WebView? or WebView. Both allowed I believe. Yes, Kotlin permits choosing nullability for Java platform types in overrides.
+
+onShowFileChooser(webView: WebView?, filePathCallback: ValueCallback<Array<Uri>>?, fileChooserParams: FileChooserParams?): Boolean — Java signature uses ValueCallback<Uri[]> and FileChooserParams. Kotlin override with nullable is fine.
+
+onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean — Java boolean onConsoleMessage(ConsoleMessage consoleMessage). Nullable fine.
+
+For web.settings.userAgentString = ....
+
+For cookies: CookieManager.getInstance().setAcceptThirdPartyCookies(web, true) requires API 21+ (min 26). Fine.
+
+Lifecycle: onPause -> web.onPause(); CookieManager.flush(); onResume -> web.onResume(). onDestroy -> web.destroy().
+
+Back button: if web.canGoBack() goBack else super.
+
+Let me include onBackPressed override (deprecated but works on plain Activity).
+
+Now the LLM call. I'll use HttpURLConnection and JSONObject. Since BASE_URL https, use URL(...).openConnection() as HttpURLConnection. Works for http and https.
+
+Parsing JSON: JSONObject(resp) then optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")?.optString("content").
+
+Now writing the request:
+
+val payload = JSONObject().apply {
+    put("model", MODEL)
+    put("messages", JSONArray().apply {
+        put(JSONObject().apply { put("role", "system"); put("content", SYSTEM_PROMPT) })
+        put(JSONObject().apply { put("role", "user"); put("content", userText) })
+    })
+}
+
+Need import org.json.JSONArray.
+
+Then:
+val conn = URL(BASE_URL).openConnection() as HttpURLConnection
+conn.requestMethod = "POST"
+conn.connectTimeout = 15000
+conn.readTimeout = 60000
+conn.doOutput = true
+conn.setRequestProperty("Content-Type", "application/json")
+conn.setRequestProperty("Authorization", "Bearer $API_KEY")
+conn.outputStream.use { it.write(payload.toString().toByteArray()) }
+if (conn.responseCode !in 200..299) { Log.e...; return null }
+val text = conn.inputStream.bufferedReader().use { it.readText() }
+
+Parse.
+
+Now MainActivity uses Llm.reply(...) in handleIncoming (already on io executor). Then sendText.
+
+Should the bot auto-reply to everything? That would spam. Add a config: AUTO_REPLY_ALL = false; if false, only reply to ! commands or !ping. But the whole point is an AI WhatsApp bot; they can flip it. I'll add private const val AUTO_REPLY_ALL = false with a clear comment: set true to route every text to the LLM. And !ping always returns pong. Good.
+
+Also skip status broadcasts and groups optionally:
+private const val REPLY_TO_GROUPS = false
+Check chatId.endsWith("@g.us"). Skip. Also skip status@broadcast.
+
+Now, dedupe: SeenStore.
+
+One more: the message id _serialized may be absent and $1 present. Handle.
+
+Let me write it.
+# Wrote android/app/src/main/java/app/waweb/local/MainActivity.kt
+package app.waweb.local
+
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.util.Log
+import android.view.ViewGroup
+import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import org.json.JSONObject
+import java.util.concurrent.Executors
+
+/**
+ * Fully local WhatsApp Web host.
+ *
+ * The APK ships no WhatsApp code of its own: it loads the real web.whatsapp.com inside a
+ * system WebView (the Chromium engine already on the phone), keeps the login in the WebView's
+ * persistent storage, and injects the SAME helper library whatsapp-web.js uses
+ * (`src/util/Injected/Utils.js`, shipped in assets/wa_utils.js).
+ *
+ * That gives you, with zero Node and zero external app:
+ *   - `window.WWebJS.getChat / sendMessage / getMessageModel` (exact upstream code)
+ *   - inbound messages via `window.require('WAWebCollections').Msg.on('add')`
+ *
+ * Login: scan the QR that web.whatsapp.com renders with the phone that owns the number.
+ * The session then survives app restarts because DOM storage + cookies are persistent.
+ */
+class MainActivity : Activity() {
+
+    private lateinit var web: WebView
+    private lateinit var seen: SeenStore
+    private val io = Executors.newSingleThreadExecutor()
+    private var fileCallback: ValueCallback<Array<Uri>>? = null
+
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        seen = SeenStore(this)
+
+        web = WebView(this)
+        setContentView(web, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+        CookieManager.getInstance().apply {
+            setAcceptCookie(true)
+            setAcceptThirdPartyCookies(web, true)
+        }
+
+        web.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true          // localStorage + IndexedDB: the WhatsApp session lives here
+            databaseEnabled = true
+            mediaPlaybackRequiresUserGesture = false
+            // WhatsApp serves a different page to a stock WebView UA; look like Chrome.
+            userAgentString = userAgentString.replace("; wv", "").replace("Version/4.0 ", "")
+        }
+
+        web.addJavascriptInterface(Bridge(), "AndroidWA")
+        web.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                if (url != null && url.contains("web.whatsapp.com")) injectBridge()
+            }
+        }
+        web.webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(m: ConsoleMessage?): Boolean {
+                if (m != null) Log.d("WAJS", "${m.message()} (${m.lineNumber()})")
+                return true
+            }
+
+            override fun onShowFileChooser(
+                webView: WebView?,
+                callback: ValueCallback<Array<Uri>>?,
+                params: FileChooserParams?,
+            ): Boolean {
+                fileCallback?.onReceiveValue(null)
+                fileCallback = callback
+                return try {
+                    startActivityForResult(params!!.createIntent(), FILE_REQ)
+                    true
+                } catch (e: Exception) {
+                    fileCallback = null
+                    false
+                }
+            }
+        }
+
+        web.loadUrl("https://web.whatsapp.com/")
+    }
+
+    /** Inject assets/wa_utils.js (upstream whatsapp-web.js helpers), then assets/wa_boot.js. */
+    private fun injectBridge() {
+        val utils = asset("wa_utils.js")
+        val boot = asset("wa_boot.js")
+        web.evaluateJavascript(utils) {
+            web.evaluateJavascript(boot, null)
+        }
+    }
+
+    private fun asset(name: String): String =
+        assets.open(name).bufferedReader().use { it.readText() }
+
+    private fun sendText(chatId: String, text: String, quotedId: String?) {
+        val js = "window.__waSend && window.__waSend(${JSONObject.quote(chatId)}, ${JSONObject.quote(text)}, " +
+            (quotedId?.let { JSONObject.quote(it) } ?: "null") + ")"
+        runOnUiThread { web.evaluateJavascript(js, null) }
+    }
+
+    private fun handleIncoming(json: String) {
+        val m = JSONObject(json)
+        val idObj = m.optJSONObject("id") ?: return
+        val id = idObj.optString("_serialized").ifEmpty { idObj.optString("\$1") }
+        val fromMe = idObj.optBoolean("fromMe")
+        val chatId = idObj.optString("remote")
+        val type = m.optString("type")
+        val body = m.optString("body")
+        val sender = m.optString("from")
+
+        if (fromMe || id.isEmpty() || chatId.isEmpty()) return
+        if (chatId == "status@broadcast") return
+        if (!REPLY_TO_GROUPS && chatId.endsWith("@g.us")) return
+        if (seen.contains(id)) return
+        seen.add(id)
+
+        Log.d(TAG, "incoming $chatId ($sender) [$type]: $body")
+        if (type != "chat") return // text only; extend for image/document here
+
+        if (body.trim().equals("!ping", ignoreCase = true)) {
+            sendText(chatId, "pong", id)
+            return
+        }
+        if (!AUTO_REPLY_ALL || !Llm.isEnabled()) return
+
+        val answer = Llm.reply(body.trim())
+        if (answer.isNullOrBlank()) return
+        sendText(chatId, answer, id)
+    }
+
+    private inner class Bridge {
+        @JavascriptInterface
+        fun onMessage(json: String) {
+            io.execute {
+                try {
+                    handleIncoming(json)
+                } catch (e: Exception) {
+                    Log.e(TAG, "onMessage failed", e)
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun onSent(json: String) = Log.d(TAG, "sent $json")
+
+        @JavascriptInterface
+        fun onError(json: String) = Log.e(TAG, "send failed $json")
+
+        @JavascriptInterface
+        fun onState(json: String) = Log.d(TAG, "state $json")
+
+        @JavascriptInterface
+        fun log(msg: String) = Log.d("WAJS", msg)
+    }
+
+    /** Bounded "already handled" set persisted across restarts, so a reload does not re-reply. */
+    private class SeenStore(ctx: Context) {
+        private val prefs = ctx.getSharedPreferences("wa_seen", Context.MODE_PRIVATE)
+
+        @Synchronized
+        fun contains(id: String): Boolean = prefs.getStringSet(KEY, emptySet())!!.contains(id)
+
+        @Synchronized
+        fun add(id: String) {
+            val next = prefs.getStringSet(KEY, emptySet())!!.toMutableSet()
+            next.add(id)
+            while (next.size > 1000) next.remove(next.first())
+            prefs.edit().putStringSet(KEY, next).apply()
+        }
+
+        private companion object { const val KEY = "ids" }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == FILE_REQ) {
+            val cb = fileCallback ?: return
+            fileCallback = null
+            cb.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data))
+        } else {
+            super.onActivityResult(requestCode, resultCode, data)
+        }
+    }
+
+    override fun onBackPressed() {
+        if (web.canGoBack()) web.goBack() else super.onBackPressed()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        CookieManager.getInstance().flush()
+        web.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        web.onResume()
+    }
+
+    override fun onDestroy() {
+        io.shutdown()
+        web.destroy()
+        super.onDestroy()
+    }
+
+    companion object {
+        private const val TAG = "WALocal"
+        private const val FILE_REQ = 1001
+
+        /** Set true to send every incoming text to the LLM (see Llm.kt). */
+        private const val AUTO_REPLY_ALL = false
+
+        /** Set true to answer group chats too. */
+        private const val REPLY_TO_GROUPS = false
+    }
+}
+
+Thought: 50ms
+Now Llm.kt.
+# Wrote android/app/src/main/java/app/waweb/local/Llm.kt
+package app.waweb.local
+
+import android.util.Log
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+
+/**
+ * Plug point for the "AI replies" half of the bridge.
+ *
+ * Works with anything that speaks the OpenAI chat-completions shape:
+ *   OpenAI     https://api.openai.com/v1/chat/completions
+ *   Groq       https://api.groq.com/openai/v1/chat/completions
+ *   OpenRouter https://openrouter.ai/api/v1/chat/completions
+ *   Ollama     http://<pc-lan-ip>:11434/v1/chat/completions   (key can be any non-empty string)
+ *
+ * Leave API_KEY blank to disable auto-replies. This runs on MainActivity's io executor,
+ * so the blocking HTTP call is fine.
+ */
+object Llm {
+    private const val BASE_URL = "https://api.openai.com/v1/chat/completions"
+    private const val MODEL = "gpt-4o-mini"
+    private const val API_KEY = "" // <-- put your key here, or point BASE_URL at a local Ollama
+
+    private const val SYSTEM_PROMPT =
+        "You are replying to a WhatsApp message on the owner's phone. " +
+            "Answer naturally and briefly. Plain text only, no markdown, no code fences."
+
+    fun isEnabled(): Boolean = API_KEY.isNotBlank()
+
+    fun reply(userText: String): String? {
+        if (!isEnabled()) return null
+        val body = JSONObject().apply {
+            put("model", MODEL)
+            put("messages", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("role", "system")
+                    put("content", SYSTEM_PROMPT)
+                })
+                put(JSONObject().apply {
+                    put("role", "user")
+                    put("content", userText)
+                })
+            })
+        }
+
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = (URL(BASE_URL).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 15_000
+                readTimeout = 60_000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("Authorization", "Bearer $API_KEY")
+            }
+            conn.outputStream.use { it.write(body.toString().toByteArray()) }
+
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                val err = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                Log.e("WALocal", "LLM HTTP $code: ${err.take(300)}")
+                return null
+            }
+            val text = conn.inputStream.bufferedReader().use { it.readText() }
+            JSONObject(text)
+                .optJSONArray("choices")
+                ?.optJSONObject(0)
+                ?.optJSONObject("message")
+                ?.optString("content")
+                ?.trim()
+        } catch (e: Exception) {
+            Log.e("WALocal", "LLM call failed", e)
+            null
+        } finally {
+            conn?.disconnect()
+        }
+    }
+}
+
+Thought: 882ms
+Now the boot JS.
+
+Careful: AndroidWA.log etc. If AndroidWA is undefined (e.g., script run in a normal browser for testing), guard. I already use try/catch in log, but referencing AndroidWA when undefined throws ReferenceError inside try — caught. Good.
+
+Write wa_boot.js.
+# Wrote android/app/src/main/assets/wa_boot.js
+/*
+ * Injected into web.whatsapp.com after the page loads.
+ *
+ * Mirrors what whatsapp-web.js does inside Puppeteer, but talks to Kotlin over the
+ * `AndroidWA` JavascriptInterface instead of Puppeteer's evaluate():
+ *   1. wait for WhatsApp's webpack module loader (`window.require`)
+ *   2. run the upstream LoadUtils() to define window.WWebJS.* (see wa_utils.js)
+ *   3. hook the same Msg collection whatsapp-web.js hooks for inbound messages
+ *   4. expose window.__waSend(chatId, text, quotedId?) for outbound sends
+ */
+(function () {
+  if (window.__waBooted) return;
+  window.__waBooted = true;
+
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+  function log() {
+    var a = [].slice.call(arguments).map(function (x) {
+      return typeof x === 'string' ? x : (function () { try { return JSON.stringify(x); } catch (e) { return String(x); } })();
+    });
+    try { AndroidWA.log(a.join(' ')); } catch (e) {}
+  }
+  function emit(fn, obj) {
+    try { AndroidWA[fn](JSON.stringify(obj)); } catch (e) { log('emit ' + fn + ': ' + e); }
+  }
+  async function waitFor(pred, tries, ms) {
+    for (var i = 0; i < tries; i++) {
+      try { if (pred()) return true; } catch (e) {}
+      await sleep(ms);
+    }
+    return false;
+  }
+
+  async function main() {
+    log('boot: waiting for WhatsApp module loader');
+
+    var haveRequire = await waitFor(function () { return typeof window.require === 'function'; }, 240, 500);
+    if (!haveRequire) { log('boot: window.require never appeared (page build changed)'); return; }
+
+    if (typeof window.WWebJS === 'undefined' && typeof window.__loadWWebUtils === 'function') {
+      try { window.__loadWWebUtils(); } catch (e) { log('boot: LoadUtils threw: ' + e); }
+    }
+    if (typeof window.WWebJS === 'undefined') { log('boot: WWebJS missing, aborting'); return; }
+    log('boot: WWebJS helpers ready');
+
+    window.__waSend = async function (chatId, text, quotedId) {
+      try {
+        var chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+        if (!chat) throw new Error('chat not found: ' + chatId);
+        var sent;
+        try {
+          sent = await window.WWebJS.sendMessage(chat, text, quotedId ? { quotedMessageId: quotedId } : {});
+        } catch (e) {
+          if (!quotedId) throw e;
+          sent = await window.WWebJS.sendMessage(chat, text, {});
+        }
+        emit('onSent', { chatId: chatId, id: sent && sent.id && sent.id._serialized });
+        return sent ? window.WWebJS.getMessageModel(sent) : null;
+      } catch (e) {
+        emit('onError', { chatId: chatId, error: String(e) });
+        return null;
+      }
+    };
+
+    var Msg;
+    var haveMsg = await waitFor(function () {
+      Msg = window.require('WAWebCollections').Msg;
+      return !!Msg && typeof Msg.on === 'function';
+    }, 120, 500);
+    if (!haveMsg) { log('boot: Msg collection unavailable'); return; }
+
+    function push(msg) {
+      try { emit('onMessage', window.WWebJS.getMessageModel(msg)); }
+      catch (e) { log('model error: ' + e); }
+    }
+
+    Msg.on('add', function (msg) {
+      try {
+        if (!msg.isNewMsg) return;
+        if (msg.type === 'ciphertext') {
+          msg.once('change:type', function (decrypted) {
+            if (decrypted && decrypted.type !== 'revoked') push(decrypted);
+          });
+          return;
+        }
+        if (msg.type === 'revoked') return;
+        push(msg);
+      } catch (e) { log('msg hook: ' + e); }
+    });
+
+    try {
+      var Sock = window.require('WAWebSocketModel').Socket;
+      if (Sock && typeof Sock.on === 'function') {
+        Sock.on('change:state', function (_s, state) { emit('onState', { state: state }); });
+        emit('onState', { state: Sock.state });
+      }
+    } catch (e) {}
+
+    log('boot: listening for messages');
+  }
+
+  main();
+})();
+
+Thought: 3.6s
+Now generate wa_utils.js from the installed package. Use bash with a here-doc? The instructions say avoid cat/echo unless necessary; here it's a build step generating a file, which is necessary. I'll use sed and a small script. Actually the tool guidance says use Write for files; but copying a 1800-line dependency into asset via Write would require reading it all. Better to use bash for this generation step (justified).
+
+Command:
+SRC=node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+OUT=android/app/src/main/assets/wa_utils.js
+{
+  printf '%s\n' ';(function () {'
+  ...
+} > "$OUT"
+
+Let me write the wrapper using printf and sed.
+
+Be careful about $ in double quotes. Use single quotes for printf format.
+
+Wrapper:
+;(function () {
+  if (window.__loadWWebUtils) return;
+  window.__loadWWebUtils = function () {
+    if (typeof window.WWebJS !== 'undefined') return;
+    var exports = {};
+    /* ===== whatsapp-web.js src/util/Injected/Utils.js (MIT License) ===== */
+<contents without leading 'use strict';>
+    exports.LoadUtils();
+    /* ===== end upstream ===== */
+  };
+})();
+
+Potential problem: upstream might use const/let — fine in Chromium. Also it may use exports. only. Good.
+
+Let me run it and then verify head/tail and JS syntax with node (node is available? likely yes given node_modules). Check with node --check.
+$ SRC=node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+OUT=android/app/src/main/assets/wa_utils.js
+{
+  printf '%s\n' ';(function () {'
+  printf '%s\n' '  if (window.__loadWWebUtils) return;'
+  printf '%s\n' '  window.__loadWWebUtils = function () {'
+  printf '%s\n' "    if (typeof window.WWebJS !== 'undefined') return;"
+  printf '%s\n' '    var exports = {};'
+  printf '%s\n' '    /* ===== upstream whatsapp-web.js src/util/Injected/Utils.js (MIT) ===== */'
+  sed "1{/^'use strict';$/d;}" "$SRC"
+  printf '%s\n' '    exports.LoadUtils();'
+  printf '%s\n' '    /* ===== end upstream ===== */'
+  printf '%s\n' '  };'
+  printf '%s\n' '})();'
+} > "$OUT"
+node --check "$OUT" && echo "syntax OK"
+wc -l "$SRC" "$OUT"
+syntax OK
+  1786 node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+  1795 android/app/src/main/assets/wa_utils.js
+  3581 total
+Thought: 561ms
+Now verify the generated wrapper's head/tail to ensure the exports.LoadUtils assignment is inside. Let me view head and around the end.
+$ sed -n '1,12p' android/app/src/main/assets/wa_utils.js; echo ...; sed -n '1786,1795p' android/app/src/main/assets/wa_utils.js
+;(function () {
+  if (window.__loadWWebUtils) return;
+  window.__loadWWebUtils = function () {
+    if (typeof window.WWebJS !== 'undefined') return;
+    var exports = {};
+    /* ===== upstream whatsapp-web.js src/util/Injected/Utils.js (MIT) ===== */
+
+exports.LoadUtils = () => {
+    window.WWebJS = {};
+
+…
+Click to expand
+Thought: 12.1s
+The generated file is structurally valid: exports.LoadUtils = () => { ... }; then exports.LoadUtils();. But note window.WWebJS = {}; inside LoadUtils resets WWebJS — fine.
+
+However, one concern: the upstream LoadUtils arrow function at the very end assigns functions; there is a call at line ~97 window.WWebJS.injectToFunction(...) which runs when LoadUtils executes at the end. Since we call exports.LoadUtils() after the definition, all good — the order in the file body is: define arrow, then call it. Wait, in JS, exports.LoadUtils = () => {...} must complete assignment before exports.LoadUtils() on the next statement. The arrow function body is not executed at definition; then we call it. Fine.
+
+But the window.WWebJS = {}; is inside the arrow, executed on call. Good.
+
+Now, potential issue: the generated file is 1795 lines and includes exports.LoadUtils but the upstream may have module.exports references? We grepped earlier — no. Good.
+
+Now, there is a subtle issue: in wa_boot.js, we call window.__loadWWebUtils() which sets window.WWebJS. But LoadUtils also calls window.WWebJS.injectToFunction(...) twice at definition time (lines ~97-118 inside LoadUtils body). Those are guarded. Good.
+
+Now, a big question: Is window.require('WAWebCollections') available at the time? whatsapp-web.js calls it after window.require exists. We wait for window.require then LoadUtils; then wait for Msg. Should be okay. But the web app may not have initialized collections until after login. If not logged in, WAWebCollections exists but Msg may still be defined. whatsapp-web.js attaches the Msg.on('add') handlers in attachEventListeners after ready. To be safe, our waitFor retries for 60s; if not, we abort and won't re-hook after login (since __waBooted is set). Hmm — if injected before login and collections aren't ready, we abort permanently. Better: don't abort; keep retrying until Msg is available, potentially minutes. Or reset __waBooted on failure? Since onPageFinished only fires once, we can't re-inject. Let me change: wait much longer / retry indefinitely for Msg (e.g., 720 tries × 1s = 12 min) and also retry window.require. Or better, set up a periodic re-check. Let me modify boot to retry for Msg with a longer window (e.g., every 2s for 30 min) — but within evaluateJavascript it's fine, it's async.
+
+Actually simpler: make the whole main retry from the start if not ready, with __waBooted reset? But re-running would call __loadWWebUtils again (guarded) and then hook. Let me restructure with a loop:
+
+async function main() {
+  while (!window.__waHooked) {
+    try {
+      if (typeof window.require !== 'function') { await sleep(500); continue; }
+      if (typeof window.WWebJS === 'undefined') { try { window.__loadWWebUtils(); } catch(e){} }
+      if (typeof window.WWebJS === 'undefined' || !window.__waSend) { ... define send ... }
+      const Msg = window.require('WAWebCollections') && window.require('WAWebCollections').Msg;
+      if (!Msg || typeof Msg.on !== 'function') { await sleep(1000); continue; }
+      hook once; window.__waHooked = true; log('listening'); break;
+    } catch(e) { await sleep(1000); }
+  }
+}
+
+But Msg.on could be defined before login, and after login the collection might be replaced? whatsapp-web.js attaches after ready; but attaching before login should still work since it's a Backbone collection that persists. To be safe, attach when Msg exists; that's likely fine.
+
+However, if __waSend is defined but chat not ready, sends only happen later. Fine.
+
+Also the risk: WAWebCollections might throw before modules load (it's window.require that returns modules). The try/catch handles.
+
+Let me rewrite wa_boot.js with a retry loop and idempotent hooking. Also, define __waSend once. Use a flag.
+
+Also handle window.require not existing but window.webpackChunk...? whatsapp-web.js relies on window.require, so trust it.
+
+Let me rewrite boot.
+
+Also, emit('onState', ...) inside loop would spam every retry. Guard with stateHooked flag.
+
+Let me rewrite cleanly.
+
+Also, I realize onPageFinished injecting on every page finished: WhatsApp web may call onPageFinished once per navigation. Good.
+
+Let me write the improved boot.
+# Wrote android/app/src/main/assets/wa_boot.js
+/*
+ * Injected into web.whatsapp.com after the page loads.
+ *
+ * Mirrors what whatsapp-web.js does inside Puppeteer, but talks to Kotlin over the
+ * `AndroidWA` JavascriptInterface instead of Puppeteer's evaluate():
+ *   1. wait for WhatsApp's webpack module loader (`window.require`)
+ *   2. run the upstream LoadUtils() to define window.WWebJS.* (see wa_utils.js)
+ *   3. hook the same Msg collection whatsapp-web.js hooks for inbound messages
+ *   4. expose window.__waSend(chatId, text, quotedId?) for outbound sends
+ *
+ * Loads before login too: it keeps retrying until the collections are usable, so the
+ * QR scan does not need a reload.
+ */
+(function () {
+  if (window.__waBooted) return;
+  window.__waBooted = true;
+
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+  function log() {
+    var a = [].slice.call(arguments).map(function (x) {
+      return typeof x === 'string' ? x : (function () { try { return JSON.stringify(x); } catch (e) { return String(x); } })();
+    });
+    try { AndroidWA.log(a.join(' ')); } catch (e) {}
+  }
+  function emit(fn, obj) {
+    try { AndroidWA[fn](JSON.stringify(obj)); } catch (e) { log('emit ' + fn + ': ' + e); }
+  }
+
+  function defineSend() {
+    if (window.__waSend) return;
+    window.__waSend = async function (chatId, text, quotedId) {
+      try {
+        var chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+        if (!chat) throw new Error('chat not found: ' + chatId);
+        var sent;
+        try {
+          sent = await window.WWebJS.sendMessage(chat, text, quotedId ? { quotedMessageId: quotedId } : {});
+        } catch (e) {
+          if (!quotedId) throw e;
+          sent = await window.WWebJS.sendMessage(chat, text, {});
+        }
+        emit('onSent', { chatId: chatId, id: sent && sent.id && sent.id._serialized });
+        return sent ? window.WWebJS.getMessageModel(sent) : null;
+      } catch (e) {
+        emit('onError', { chatId: chatId, error: String(e) });
+        return null;
+      }
+    };
+  }
+
+  var stateHooked = false;
+  function hookState() {
+    if (stateHooked) return;
+    try {
+      var Sock = window.require('WAWebSocketModel').Socket;
+      if (!Sock || typeof Sock.on !== 'function') return;
+      Sock.on('change:state', function (_s, state) { emit('onState', { state: state }); });
+      emit('onState', { state: Sock.state });
+      stateHooked = true;
+    } catch (e) {}
+  }
+
+  function push(msg) {
+    try { emit('onMessage', window.WWebJS.getMessageModel(msg)); }
+    catch (e) { log('model error: ' + e); }
+  }
+
+  var msgHooked = false;
+  function hookMessages() {
+    if (msgHooked) return;
+    var Msg = window.require('WAWebCollections').Msg;
+    if (!Msg || typeof Msg.on !== 'function') return;
+
+    Msg.on('add', function (msg) {
+      try {
+        if (!msg.isNewMsg) return;
+        if (msg.type === 'ciphertext') {
+          msg.once('change:type', function (decrypted) {
+            if (decrypted && decrypted.type !== 'revoked') push(decrypted);
+          });
+          return;
+        }
+        if (msg.type === 'revoked') return;
+        push(msg);
+      } catch (e) { log('msg hook: ' + e); }
+    });
+    msgHooked = true;
+  }
+
+  async function main() {
+    log('boot: waiting for WhatsApp internals');
+    for (;;) {
+      try {
+        if (typeof window.require !== 'function') { await sleep(500); continue; }
+
+        if (typeof window.WWebJS === 'undefined' && typeof window.__loadWWebUtils === 'function') {
+          try { window.__loadWWebUtils(); } catch (e) { log('LoadUtils: ' + e); }
+        }
+        if (typeof window.WWebJS === 'undefined') { await sleep(1000); continue; }
+
+        defineSend();
+        hookState();
+        hookMessages();
+
+        if (msgHooked) { log('boot: listening for messages'); return; }
+      } catch (e) {
+        log('boot retry: ' + e);
+      }
+      await sleep(1000);
+    }
+  }
+
+  main();
+})();
+
+Thought: 232ms
+Now verify JS syntax of both assets.
+$ node --check android/app/src/main/assets/wa_boot.js && node --check android/app/src/main/assets/wa_utils.js && echo "both OK"; find android -type f | sort
+both OK
+android/app/build.gradle.kts
+android/app/src/main/AndroidManifest.xml
+android/app/src/main/assets/wa_boot.js
+android/app/src/main/assets/wa_utils.js
+android/app/src/main/java/app/waweb/local/Llm.kt
+android/app/src/main/java/app/waweb/local/MainActivity.kt
+android/build.gradle.kts
+android/gradle.properties
+android/gradle/wrapper/gradle-wrapper.properties
+…
+Click to expand
+Thought: 12.3s
+Now I should sanity-check the Kotlin for compile errors. I can't compile without the Android SDK. Let me review mentally:
+
+1. setContentView(web, ViewGroup.LayoutParams(...)) — Activity.setContentView(View view, ViewGroup.LayoutParams params) exists. Yes.
+
+2. CookieManager.getInstance().setAcceptThirdPartyCookies(web, true) — method exists (API 21).
+
+3. web.settings.userAgentString = ... fine.
+
+4. web.addJavascriptInterface(Bridge(), "AndroidWA") — Bridge is an inner class; fine.
+
+5. web.webViewClient = object : WebViewClient() { override fun onPageFinished(view: WebView?, url: String?) { super.onPageFinished(view, url) ... } } — Java method onPageFinished(WebView view, String url). Overriding with nullable platform types: Kotlin allows. super.onPageFinished(view, url) expects non-null platform types; passing nullable WebView?/String? to platform types is allowed (platform types accept nullable). Yes.
+
+6. onConsoleMessage(m: ConsoleMessage?): Boolean — Java boolean onConsoleMessage(ConsoleMessage consoleMessage). Fine.
+
+7. onShowFileChooser(webView: WebView?, callback: ValueCallback<Array<Uri>>?, params: FileChooserParams?): Boolean — The Java signature is boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, FileChooserParams fileChooserParams). In Kotlin, Uri[] maps to Array<Uri>. Correct. params!!.createIntent() exists.
+
+8. fileCallback?.onReceiveValue(null) — onReceiveValue(Array<Uri>?)? The Java ValueCallback<Uri[]>.onReceiveValue(Uri[] value) — platform type accepts null. Kotlin Array<Uri>. Passing null is allowed for platform type. Fine.
+
+9. web.evaluateJavascript(utils) { web.evaluateJavascript(boot, null) } — evaluateJavascript(String, ValueCallback<String>?). The SAM lambda: in Kotlin, evaluateJavascript(script) { ... } works if the last param is ValueCallback<String>?; trailing lambda for Java SAM works. Yes.
+
+10. runOnUiThread { web.evaluateJavascript(js, null) } fine.
+
+11. JSONObject.quote(...) is a static method JSONObject.quote(String). Yes.
+
+12. idObj.optString("\$1") — In Kotlin string, "\$1" is literal $1. Good.
+
+13. private class SeenStore(ctx: Context) — Context imported. prefs.getStringSet(KEY, emptySet()) — type inference: emptySet<String>()? getStringSet(String, Set<String>?) expects Set<String>?. emptySet() infers Set<String>. Then !!. Good. next.add(id), next.remove(next.first()). toMutableSet() gives MutableSet<String>. Good.
+
+14. override fun onBackPressed() — Activity.onBackPressed() is deprecated in API 33 but still overridable. Compiles with warning. Fine.
+
+15. io.shutdown() and web.destroy() on onDestroy. Fine.
+
+16. seen.contains/seen.add calls from handleIncoming on io thread. Fine.
+
+17. companion object with private consts inside MainActivity; FILE_REQ referenced in anonymous WebChromeClient inside onCreate — accessible via companion. Yes.
+
+18. REPLY_TO_GROUPS, AUTO_REPLY_ALL referenced in member function — companion const accessible. Yes.
+
+Llm.kt:
+- (URL(BASE_URL).openConnection() as HttpURLConnection).apply { ... } then conn.outputStream. Fine.
+- conn.responseCode, conn.errorStream, conn.inputStream. Fine.
+- return inside try in a function returning String? — return null inside try with finally is fine.
+- JSONObject(text).optJSONArray("choices")?.optJSONObject(0)?... — JSONArray.optJSONObject(int) returns JSONObject?. Chaining with ?. good.
+- put("messages", JSONArray().apply { put(...) }) — JSONArray.put(Object); JSONObject is Object. Good. But inside apply, put refers to JSONArray.put. Yes.
+- JSONObject().apply { put("model", MODEL) ... } — put is JSONObject's, throws JSONException (unchecked). Fine.
+
+One issue: In Llm.reply, conn is declared var conn: HttpURLConnection? = null, assigned inside try, used in finally. Smart cast not needed since ?.. But conn.outputStream — conn is nullable HttpURLConnection? after assignment. Kotlin smart-casts local var? It's assigned in the same scope; after conn = ..., conn is known non-null? The variable is mutable and captured? It's not captured in a lambda, so smart cast may work. Actually conn = (URL(...).openConnection() as HttpURLConnection).apply {...} — after assignment, conn.outputStream requires non-null. Kotlin smart cast for local var works if not modified in a closure. It's not. But there's a finally { conn?.disconnect() } — fine. I think conn.outputStream compiles due to smart cast. To be safe, use a local non-null val c = ...; conn = c; c.outputStream.... Let me refactor to avoid any doubt.
+
+Let me update Llm to use val c.
+
+Also, android.util.Log import fine.
+
+Let me patch Llm.
+← Edit android/app/src/main/java/app/waweb/local/Llm.kt
+}
+
+var conn: HttpURLConnection? = null
+return try {
+    conn = (URL(BASE_URL).openConnection() as HttpURLConnection).apply {
+    val c = (URL(BASE_URL).openConnection() as HttpURLConnection).apply {
+        requestMethod = "POST"
+        connectTimeout = 15_000
+        readTimeout = 60_000
+        doOutput = true
+        setRequestProperty("Content-Type", "application/json")
+        setRequestProperty("Authorization", "Bearer $API_KEY")
+    }
+    conn.outputStream.use { it.write(body.toString().toByteArray()) }
+    conn = c
+    c.outputStream.use { it.write(body.toString().toByteArray()) }
+
+    val code = conn.responseCode
+    val code = c.responseCode
+    if (code !in 200..299) {
+        val err = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+        val err = c.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+        Log.e("WALocal", "LLM HTTP $code: ${err.take(300)}")
+        return null
+    }
+    val text = conn.inputStream.bufferedReader().use { it.readText() }
+    val text = c.inputStream.bufferedReader().use { it.readText() }
+    JSONObject(text)
+        .optJSONArray("choices")
+        ?.optJSONObject(0)
+        ?.optJSONObject("mess

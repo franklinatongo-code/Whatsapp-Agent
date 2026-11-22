@@ -1,0 +1,832 @@
+The user wants the reply inline (in chat), not in files — and they want the AI reply part to support stickers, typing indicators, "looking online" (presence/online), etc. They're saying "especially the AI reply part sticker typing making me look online etc" — i.e., they want the code/knowledge for: sending stickers, typing indicator ("composing"), making them appear online, etc., for the AI reply.
+
+But they said "in a reply not in files" — so they don't want me to create files; they want the code in the chat response. Hmm. I already created files. They now want the explanation/code inline.
+
+So I should output the relevant code snippets in the chat, not in files. Focus on the AI reply extras:
+- typing indicator (composing/paused)
+- online presence ("making me look online")
+- stickers (send sticker from image)
+- also maybe mark seen
+
+Let me look at the exact wwebjs/Utils functions available: window.WWebJS.sendChatstate (line 1240) which sends chat state (typing, recording, paused), and window.WWebJS.sendSeen. For online presence, whatsapp-web.js Client has sendPresenceAvailable() / sendPresenceUnavailable(). Let me check the Client.js for sendPresence and the injected code. Also stickers: WWebJS.sendMessage(chat, media, { sendMediaAsSticker: true }) or processStickerData. Let me inspect.
+
+Let me grep Client.js for sendPresenceAvailable and sendSeen, and Utils.js sendChatstate + processStickerData.
+
+Then I'll produce inline code:
+1. JS window.__waSend extended with options (text/sticker/typing/presence).
+2. Kotlin snippet for typing + presence + sticker.
+3. Maybe a sticker "AI reply" example.
+
+Also "making me look online" — WAWebPresenceChatAction / sendPresenceAvailable. In whatsapp-web.js Client: sendPresenceAvailable() uses window.require('WAWebPresenceChatAction').sendPresenceAvailable() maybe. Let me check.
+
+Let me inspect the relevant code.
+$ grep -n "sendPresenceAvailable\|sendPresenceUnavailable\|sendSeen\|setChatState\|sendChatstate" node_modules/whatsapp-web.js/src/Client.js | head; echo ---; sed -n '1240,1262p' node_modules/whatsapp-web.js/src/util/Injected/Utils.js; echo ---; grep -n "sendPresenceAvailable\|sendPresenceUnavailable" node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+1350:    async sendSeen(chatId) {
+1352:            return window.WWebJS.sendSeen(chatId);
+1378:     * @property {boolean} [sendSeen=true] - Mark the conversation as seen after sending the message
+1485:        const sendSeen = options.sendSeen !== false;
+1545:            async (chatId, content, options, sendSeen) => {
+1552:                if (sendSeen) {
+1553:                    await window.WWebJS.sendSeen(chatId);
+1618:            sendSeen,
+2047:    async sendPresenceAvailable() {
+2051:                .sendPresenceAvailable();
+…
+Click to expand
+$ sed -n '2040,2070p' node_modules/whatsapp-web.js/src/Client.js; echo ---; grep -n "processStickerData\|sendMediaAsSticker\|toStickerData" node_modules/whatsapp-web.js/src/util/Injected/Utils.js | head; echo ---; sed -n '663,715p' node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+return window.require('WAWebSocketModel').Socket.state ?? null;
+        });
+    }
+
+    /**
+     * Marks the client as online
+     */
+    async sendPresenceAvailable() {
+        return await this.pupPage.evaluate(() => {
+            return window
+…
+Click to expand
+Thought: 7.6s
+Now I have everything. The user wants the AI reply part: sticker, typing indicator, "making me look online" etc. — code inline in the reply, not files.
+
+I should give:
+1. A single JS helper bundle (to put in wa_boot.js or run via evaluateJavascript) exposing:
+   - __waPresence('available'|'unavailable')
+   - __waTyping(chatId, on) 
+   - __waSeen(chatId)
+   - __waSendText(chatId, text, quotedId) (already)
+   - __waSendSticker(chatId, base64, mimetype) — converts image to webp then sends as sticker.
+   - Maybe __waSendMedia.
+
+2. Kotlin snippets to call them and to simulate typing while the LLM thinks (start typing, send, stop). And presence available on start.
+
+3. Explain "looking online" = sendPresenceAvailable(); note it marks the account online globally.
+
+4. Note the AI-reply flow: on message → sendSeen → presence available → typing → LLM (show typing meanwhile, maybe periodic refresh) → send → paused.
+
+The user says "in a reply not in files especially the ai reply part sticker typing making me look online etc" → They want me to answer in the chat with the code, not edit files. So I'll provide inline code and not touch files. Good — no tool edits needed. But should I read anything else? Maybe check whether presence has privacy constraints. Enough.
+
+Important detail: WhatsApp web chat state "composing" expires after ~10s? WhatsApp's typing indicator times out; to keep typing while a slow LLM responds, re-send composing every ~8s. I'll mention.
+
+Another: Stickers must be WebP 512x512. toStickerData converts via WAWebImageUtils.toWebpSticker(file) which handles resizing probably. mediaInfoToFile({mimetype, data}). So __waSendSticker:
+
+window.__waSendSticker = async function (chatId, base64, mimetype) {
+  const media = window.WWebJS.toStickerData
+    ? await window.WWebJS.toStickerData({ mimetype: mimetype || 'image/jpeg', data: base64 })
+    : { mimetype: 'image/webp', data: base64 };
+  const chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+  await window.WWebJS.sendMessage(chat, undefined, { media: media, sendMediaAsSticker: true });
+};
+
+Wait: sendMessage(chat, content, options) with options.media and sendMediaAsSticker. In the code: if options.media, it calls processStickerData(options.media) if sendMediaAsSticker. So options.media must already be {mimetype:'image/webp', data}. So:
+
+const sticker = await window.WWebJS.toStickerData({mimetype, data: base64});
+await window.WWebJS.sendMessage(chat, undefined, { media: sticker, sendMediaAsSticker: true });
+
+mediaInfoToFile expects {data, mimetype, filename} where data is base64. Let me verify mediaInfoToFile and arrayBufferToBase64. Lines 1131-1157.
+$ sed -n '1131,1170p' node_modules/whatsapp-web.js/src/util/Injected/Utils.js; echo ---; sed -n '715,760p' node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+window.WWebJS.mediaInfoToFile = ({ data, mimetype, filename }) => {
+        const binaryData = window.atob(data);
+
+        const buffer = new ArrayBuffer(binaryData.length);
+        const view = new Uint8Array(buffer);
+        for (let i = 0; i < binaryData.length; i++) {
+            view[i] = binaryData.charCodeAt(i);
+        }
+
+        const blob = new Blob([buffer], { type: mimetype });
+…
+Click to expand
+Thought: 6.2s
+Confirmed. toStickerData expects data base64, mimetype, optional filename. It converts to WebP via WAWebImageUtils.toWebpSticker.
+
+Now, presence: window.require('WAWebPresenceChatAction').sendPresenceAvailable(). Also there's per-chat "online" via sendChatStateComposing? No. The global available is what makes the phone show "online". Also "typing" per chat uses sendChatstate('typing', chatId).
+
+Also "making me look online" could mean keeping presence online continuously — WhatsApp Web typically goes offline when the tab/app isn't focused. The sendPresenceAvailable marks available; but the web client may send unavailable when the page is hidden. To keep online, re-send available periodically (e.g., every 60s) and on visibilitychange.
+
+Also "recording" state exists for audio.
+
+Now the user wants the AI reply part. So the flow:
+1. Incoming message → mark read (sendSeen).
+2. sendPresenceAvailable().
+3. sendChatstate('typing', chatId) — maybe repeat every 8s while waiting on LLM.
+4. Get LLM reply.
+5. sendChatstate('stop', chatId).
+6. Send text OR sticker (if reply is e.g. a sticker trigger).
+7. Optionally send "paused".
+
+I'll provide a single JS file content (for them to paste into wa_boot.js or evaluate) and Kotlin snippets.
+
+Since they said "in a reply not in files", I'll present code blocks in chat. No file edits.
+
+Let me also address "sticker" in two senses:
+- The AI replies with a sticker (send sticker).
+- The user sends a sticker to the bot, and it should handle it (inbound type === 'sticker'; currently we ignore non-text). For stickers, WhatsApp may not give body; if the sticker is animated, etc. To receive a sticker and have the AI understand it, you'd download the media (msg.downloadMedia()) — but our injected code doesn't include download. whatsapp-web.js Client.downloadMedia uses window.WWebJS.getMediaInfo? Let me check. Actually Message.downloadMedia() in structures/Message.js calls window.WWebJS.downloadMedia? Let me grep.
+
+But the user likely means "AI reply part: sticker, typing, making me look online" — i.e., the bot should send stickers, show typing, and appear online. I'll cover outbound sticker + typing + presence, and briefly inbound sticker handling.
+
+Let me check the download media injection in case they want to receive stickers/images.
+$ grep -rn "downloadMedia\|decryptMedia\|getMessageMedia" node_modules/whatsapp-web.js/src/structures/Message.js | head; echo ---; grep -n "downloadMedia" node_modules/whatsapp-web.js/src/Client.js | head
+515:    async downloadMedia() {
+539:                await msg.downloadMedia({
+---
+$ sed -n '500,570p' node_modules/whatsapp-web.js/src/structures/Message.js
+const chatId = typeof chat === 'string' ? chat : chat.id._serialized;
+
+        await this.client.pupPage.evaluate(
+            async (msgId, chatId) => {
+                return window.WWebJS.forwardMessage(chatId, msgId);
+            },
+            this.id._serialized,
+            chatId,
+        );
+    }
+…
+Click to expand
+Thought: 20.7s
+Good, but inbound media is a bigger topic. The user asked "especially the ai reply part sticker typing making me look online etc". I'll focus on outbound sticker, typing, presence, and mention inbound sticker via downloadMedia briefly.
+
+Now, the response should be inline code. The user said "in a reply not in files" — so do not use tools to write files. Just answer.
+
+Let me construct the final answer with:
+
+1. Drop-in JS (paste at the end of wa_boot.js, or run it via evaluateJavascript)
+
+window.__waPresence = async (online) => {
+  const A = window.require('WAWebPresenceChatAction');
+  return online ? A.sendPresenceAvailable() : A.sendPresenceUnavailable();
+};
+
+window.__waSeen = (chatId) => window.WWebJS.sendSeen(chatId);
+
+window.__waTyping = (chatId, on) =>
+  window.WWebJS.sendChatstate(on ? 'typing' : 'stop', chatId);
+
+window.__waSticker = async (chatId, base64, mimetype) => {
+  const sticker = await window.WWebJS.toStickerData({ data: base64, mimetype });
+  const chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+  const sent = await window.WWebJS.sendMessage(chat, undefined, {
+    media: sticker,
+    sendMediaAsSticker: true,
+  });
+  return sent && sent.id && sent.id._serialized;
+};
+
+Note: mimetype must be the real one (image/jpeg, image/png). WebP 512x512 is ideal; toStickerData converts. If already webp, pass through.
+
+2. Kotlin: the AI reply flow with typing + presence
+
+private fun sendJs(js: String) = runOnUiThread { try { web.evaluateJavascript(js, null) } catch (_: Exception) {} }
+
+private fun quote(s: String) = JSONObject.quote(s)
+
+private fun setOnline(on: Boolean) =
+    sendJs("window.__waPresence && window.__waPresence(${if (on) "true" else "false"})")
+
+private fun typing(chatId: String, on: Boolean) =
+    sendJs("window.__waTyping && window.__waTyping(${quote(chatId)}, ${if (on) "true" else "false"})")
+
+private fun seen(chatId: String) =
+    sendJs("window.__waSeen && window.__waSeen(${quote(chatId)})")
+
+private fun replySticker(chatId: String, bytes: ByteArray, mime: String) {
+    val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+    sendJs("window.__waSticker && window.__waSticker(${quote(chatId)}, ${quote(b64)}, ${quote(mime)})")
+}
+
+3. Wire it into handleIncoming — show the modified core:
+
+private fun handleIncoming(...) {
+    ...
+    setOnline(true)
+    seen(chatId)
+    typing(chatId, true)
+    val keepTyping = timer.scheduleAtFixedRate(...) // re-send composing every 8s
+    io.execute {
+        val answer = Llm.reply(body)
+        ...
+        typing(chatId, false)
+        if (answer.startsWith("[sticker]")) replySticker(chatId, ...) else sendText(chatId, answer, id)
+    }
+}
+
+Need to be careful: handleIncoming is already on the io thread, so don't nest another io.execute. I'll present it as the new body. Use a java.util.Timer or ScheduledExecutorService. Keep typing refreshed with a ScheduledFuture on a scheduler.
+
+Actually simpler: since the LLM call blocks on the io thread, we need a separate scheduler to refresh typing. Provide:
+
+private val ticker = Executors.newSingleThreadScheduledExecutor()
+
+private fun typingWhile(chatId: String): ScheduledFuture<*> =
+    ticker.scheduleAtFixedRate({ typing(chatId, true) }, 8, 8, TimeUnit.SECONDS)
+Then f.cancel(false); typing(chatId,false).
+
+Note typing marshals to the UI thread via runOnUiThread; fine.
+
+4. "look online" caveat: sendPresenceAvailable marks the whole account available; WhatsApp flips to unavailable when the page is hidden. Keep it alive by calling on onResume and every ~60s (or on visibilitychange). Also note it can be overridden by your phone's WhatsApp if you also use the phone; and privacy settings ("Last seen/Online") affect what others see. And send availability updates can be rate-limited; don't spam.
+
+5. Sticker format note: WebP, max 512x512 (static) or 512x512 animated; WhatsApp rejects >1MB for animated stickers. toStickerData converts and resizes via WAWebImageUtils. If it fails, use WAWebImageUtils.toWebpSticker requirements.
+
+6. Inbound stickers: type === 'sticker' and downloadMedia path — brief. Could include JS:
+
+window.__waMedia = async (msgId) => {
+  const msg = window.require('WAWebCollections').Msg.get(msgId) || ...;
+  if (!msg || !msg.mediaData) return null;
+  if (msg.mediaData.mediaStage !== 'RESOLVED') await msg.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 });
+  ...
+  const media = await window.require('WAWebDownloadManager').downloadManager.downloadAndMaybeDecrypt({...});
+  return window.WWebJS.arrayBufferToBase64(media);
+};
+
+That's long; maybe skip or give a compact version. The user's emphasis is outbound ("AI reply part"). I'll mention that inbound media needs the downloadMedia call and offer to add it.
+
+Also, "making me look online" — maybe they mean the AI should seem like them online, i.e., preserve human-like behavior. Yes.
+
+I should also include the "human-like" niceties: variable typing delay proportional to reply length, mark seen immediately, send paused before sending, etc. This is what makes it "look online" and natural.
+
+Let me also warn: marking online constantly and instant replies increase ban risk. Note briefly.
+
+Now, the format: The user said "in a reply not in files" — so code blocks in chat. Keep it organized but not overly long. They asked for "etc", so I can include the main ones.
+
+Let me write the answer. I'll keep it focused and include exact code.
+
+One more check: sendChatstate state values: 'typing', 'recording', 'stop'. Good.
+
+Presence: WAWebPresenceChatAction.sendPresenceAvailable(). Good.
+
+Sticker: toStickerData exists. Good.
+
+Also, window.WWebJS.sendMessage(chat, undefined, {media, sendMediaAsSticker:true}). In sendMessage, content is optional; options.media branch sets content = undefined. Good.
+
+Let me write.
+
+I should mention these helpers assume window.WWebJS already exists (it does after wa_boot) and window.require is present.
+
+Kotlin import needed: java.util.Base64 (API 26+, fine), java.util.concurrent.ScheduledFuture, TimeUnit.
+
+Base64: android.util.Base64 vs java.util.Base64. Both work; android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP). I'll use android.util.Base64.
+
+Now, the typing ticker: If multiple chats, keyed timers. Keep simple with a map. I'll show a simple version.
+
+Let me draft the final.
+
+Also, one nuance: sending typing for a chat requires the chat to exist in collection. sendChatstate uses createWid(chatId) directly, no Chat lookup. Good.
+
+For sendSeen, it looks up chat; fine.
+
+Let me include a compact JS block and Kotlin block.
+
+Also mention where to paste JS: in wa_boot.js after defineSend or as a separate evaluateJavascript call after boot. Since they don't want files touched, just say "append these to the injected script (or evaluate once after boot)".
+
+Final answer length: maybe 80-120 lines of code + short notes. Acceptable given the request.
+
+Let me ensure correctness of window.__waSticker: toStickerData returns {mimetype:'image/webp', data}; then processStickerData is called by sendMessage when sendMediaAsSticker is true. Wait: in sendMessage, if options.media, it does:
+mediaOptions = options.sendMediaAsSticker && !isChannel && !isStatus
+  ? await window.WWebJS.processStickerData(options.media)
+  : await window.WWebJS.processMediaData(...)
+So passing the already-converted webp to processStickerData is correct.
+
+Good.
+
+Now, "sticker from text"? There are text-to-sticker services, but not needed.
+
+One more: The AI might want to send an image as a sticker (e.g., generated). They can pass the JPEG bytes.
+
+Now the response.
+Here's the inline code for the AI-reply extras (typing, presence/online, stickers). No file changes.
+1. JS helpers — paste at the end of wa_boot.js (or run once after boot)
+// presence: makes the account show "online" to contacts
+window.__waPresence = async (online) => {
+  const A = window.require('WAWebPresenceChatAction');
+  return online ? A.sendPresenceAvailable() : A.sendPresenceUnavailable();
+};
+
+// read receipts
+window.__waSeen = (chatId) => window.WWebJS.sendSeen(chatId);
+
+// "typing..." bubble. on=true -> composing, on=false -> paused
+window.__waTyping = (chatId, on) =>
+  window.WWebJS.sendChatstate(on ? 'typing' : 'stop', chatId);
+
+// recording bubble (voice note)
+window.__waRecording = (chatId, on) =>
+  window.WWebJS.sendChatstate(on ? 'recording' : 'stop', chatId);
+
+// send any jpeg/png/webp as a WhatsApp sticker (auto-converts to WebP)
+window.__waSticker = async (chatId, base64, mimetype) => {
+  const sticker = await window.WWebJS.toStickerData({ data: base64, mimetype });
+  const chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+  const sent = await window.WWebJS.sendMessage(chat, undefined, {
+    media: sticker,
+    sendMediaAsSticker: true,
+  });
+  return sent && sent.id && sent.id._serialized;
+};
+toStickerData → processStickerData is the exact upstream path (Utils.js:663/:679); stickers must end up WebP, ≤512×512, ≤1 MB animated.
+2. Kotlin — the honest "human" reply flow
+import android.util.Base64
+import java.util.concurrent.*
+
+private val ticker = Executors.newSingleThreadScheduledExecutor()
+private val typingJobs = ConcurrentHashMap<String, ScheduledFuture<*>>()
+
+private fun js(code: String) = runOnUiThread {
+    try { web.evaluateJavascript(code, null) } catch (_: Exception) {}
+}
+private fun q(s: String) = JSONObject.quote(s)
+
+private fun online(on: Boolean) = js("window.__waPresence && window.__waPresence($on)")
+private fun seen(chatId: String) = js("window.__waSeen && window.__waSeen(${q(chatId)})")
+private fun typing(chatId: String, on: Boolean) =
+    js("window.__waTyping && window.__waTyping(${q(chatId)}, $on)")
+
+// WhatsApp drops the composing state after ~10s, so refresh it while the LLM thinks
+private fun typingWhile(chatId: String) {
+    typing(chatId, true)
+    typingJobs.remove(chatId)?.cancel(false)
+    typingJobs[chatId] = ticker.scheduleAtFixedRate(
+        { typing(chatId, true) }, 8, 8, TimeUnit.SECONDS
+    )
+}
+private fun typingDone(chatId: String) {
+    typingJobs.remove(chatId)?.cancel(false)
+    typing(chatId, false)
+}
+
+private fun sendSticker(chatId: String, bytes: ByteArray, mime: String) {
+    val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+    js("window.__waSticker && window.__waSticker(${q(chatId)}, ${q(b64)}, ${q(mime)})")
+}
+3. Wire it into handleIncoming (MainActivity.kt:130)
+Replace the reply tail with:
+online(true)                 // "look online" for this burst
+seen(chatId)                 // blue ticks immediately
+typingWhile(chatId)          // "typing..." while the model runs
+
+var answer: String? = null
+try {
+    answer = Llm.reply(body.trim())
+} finally {
+    typingDone(chatId)
+}
+
+when {
+    answer.isNullOrBlank() -> {}
+    answer.startsWith("[sticker]") -> {
+        // e.g. "[sticker] assets/hi.webp" or bytes you generated
+        val f = File(answer.removePrefix("[sticker]").trim())
+        if (f.exists()) sendSticker(chatId, f.readBytes(), "image/webp")
+    }
+    else -> sendText(chatId, answer, id)
+}
+4. Keep it looking online
+sendPresenceAvailable() only pings once; Chrome/WebView reports unavailable when the page loses focus. To stay online:
+override fun onResume() {
+    super.onResume()
+    web.onResume()
+    online(true)
+    ticker.scheduleAtFixedRate({ online(true) }, 60, 60, TimeUnit.SECONDS)
+}
+override fun onPause() {
+    typingJobs.values.forEach { it.cancel(false) }
+    CookieManager.getInstance().flush()
+    web.onPause()
+    super.onPause()
+}
+Caveats:
+- Presence is account-wide, and WhatsApp respects the user's privacy settings ("Online"/"Last seen"); if they're hidden, contacts won't see it anyway.
+- Don't spam presence/typing — WhatsApp rate-limits and it raises ban risk. The 8s typing refresh + 60s presence ping is safe-ish.
+- A message sent while the phone (primary device) is also active can race; keep the bot on a spare number.
+Want the inbound side too (receiving stickers/images and feeding them to the AI via msg.downloadMedia() + base64)? I can add that in the next reply.
+▣  Build · DeepSeek V4.1 Flash Free · 1m 12s
+how it usin my ai to reply code the how it replies
+Thought: 31.2s
+The user asks: "how it usin my ai to reply code the how it replies" — they want the code for how the AI is used to reply, i.e., the plumbing from incoming WhatsApp message → their AI → reply back. Inline reply, not files (continuing the "in a reply not in files" constraint).
+
+They likely mean: "how is it using my AI to reply — code the how it replies". So show the exact code path: Llm.reply implementation, how it's called, how response is sent, maybe adapt to their own AI provider. They might want the code of Llm.kt (which is in files) but presented inline. Or they want to know how to plug their AI (maybe opencode / a local model / an API) into the reply flow.
+
+I should give:
+1. The full reply pipeline, step by step with code:
+   - inbound hook in JS emits model → Kotlin bridge → handler
+   - handler: seen, typing, call AI
+   - AI call (HTTP OpenAI-compatible) — full Kotlin code
+   - send back (text, chunking, sticker)
+2. Show how to swap in their own AI (their server, opencode, local model).
+3. Mention conversation history / per-chat context, timeouts, errors.
+4. Keep it inline, no file edits.
+
+Given previous context, they said "in a reply not in files" — so no tools. Just answer with code.
+
+Let me be precise and re-use the exact repo/engine APIs. Include:
+- Llm.kt full contents (inline) — it already exists in files, but they want it in the reply.
+- The handler snippet (already shown partly). Now show the complete reply function including chunking (WhatsApp text limit ~65k, but sensible chunking as their bridge did 3800 chars), and error fallback.
+- Conversation history per chat (optional but "how it replies" — context). Show a small History map with last N turns persisted maybe.
+- How to point it at their AI: base URL/key/model. Also if they mean the opencode run bridge — explain you can't run opencode on Android; options: call a server endpoint that runs opencode, or use an API/local llama.cpp.
+
+I should clarify what "my ai" might be. Could be their opencode bridge. But on Android, fully local, they'd use:
+- remote HTTP to an OpenAI-compatible endpoint
+- or a local model via MediaPipe LLM / llama.cpp JNI / ONNX.
+
+I'll show the generic HTTP path and note how to swap the body.
+
+Let me structure:
+
+The reply path (end to end)
+1. JS emits inbound (already in wa_boot): Msg.on('add') → AndroidWA.onMessage(JSON.stringify(getMessageModel(msg)))
+2. Kotlin Bridge.onMessage → io thread → handleIncoming
+3. handleIncoming filters, seen, typingWhile, Llm.reply(...), typingDone, sendText / sendSticker
+4. sendText → window.__waSend → WWebJS.sendMessage
+5. __waSend reports onSent/onError back to Kotlin.
+
+Full code — Llm.kt (inline), handleIncoming reply part, sendText with chunking.
+
+Using your own AI — modify BASE_URL/MODEL/KEY or replace reply() with a call to your server.
+
+Context — per-chat history list, system prompt, trimmed.
+
+Let me write accurate Kotlin.
+
+Chunking: their bridge chunks at 3800 chars and sends multiple sequential texts. I'll include a chunker. WhatsApp limit is 65,536, but sending huge texts in one go is fine; chunking is friendlier. Use 4000.
+
+sendText currently sends one evaluateJavascript per chunk; since __waSend is async, sending chunks back-to-back might interleave/race. Add small delay? Can't easily on UI thread. Could chain in JS: window.__waSendMany(chatId, [parts]). Better: add JS helper that sends sequentially:
+
+window.__waSendMany = async (chatId, parts, quotedId) => {
+  const chat = await window.WWebJS.getChat(chatId, {getAsModel:false});
+  let first = true;
+  for (const part of parts) {
+    await window.WWebJS.sendMessage(chat, part, first && quotedId ? {quotedMessageId: quotedId} : {});
+    first = false;
+  }
+};
+
+But that's adding JS. I can show it since it's part of "how it replies".
+
+Alternatively keep sendText single-call with chunking done in JS via __waSend loop. Let me present a __waReply(chatId, text, quotedId) that chunks and sends sequentially. That replaces sendText.
+
+Let me include:
+
+window.__waReply = async (chatId, text, quotedId, chunkSize = 4000) => {
+  const chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+  if (!chat) throw new Error('no chat ' + chatId);
+  const parts = [];
+  let rest = text;
+  while (rest.length > chunkSize) {
+    let cut = rest.lastIndexOf('\n', chunkSize);
+    if (cut < chunkSize * 0.5) cut = rest.lastIndexOf(' ', chunkSize);
+    if (cut < chunkSize * 0.5) cut = chunkSize;
+    parts.push(rest.slice(0, cut)); rest = rest.slice(cut).replace(/^\s+/, '');
+  }
+  if (rest) parts.push(rest);
+  for (let i = 0; i < parts.length; i++) {
+    try {
+      await window.WWebJS.sendMessage(chat, parts[i], i === 0 && quotedId ? { quotedMessageId: quotedId } : {});
+    } catch (e) {
+      if (i !== 0 || !quotedId) throw e;
+      await window.WWebJS.sendMessage(chat, parts[i], {});
+    }
+  }
+};
+
+Then Kotlin sendText calls window.__waReply(...).
+
+Now the AI call. Include the full Llm.kt with conversation history:
+
+object Llm {
+    private const val BASE_URL = "https://api.openai.com/v1/chat/completions"
+    private const val MODEL = "gpt-4o-mini"
+    private const val API_KEY = ""
+    ...
+    fun reply(chatId: String, userText: String): String? { ... includes history ... }
+}
+
+History per chat: a ConcurrentHashMap<String, ArrayDeque<Pair<String,String>>> with cap. Persisting to SharedPreferences is optional. Keep in-memory.
+
+Show the JSON building with history.
+
+Also show how to call their own server (simple mode) — if their "AI" is the opencode bridge, replace the body with a POST to their server returning {reply: "..."}. Provide a replyViaMyServer() alternative.
+
+Now, "how it replies" could also mean the exact reply text flow. I'll narrate with a numbered diagram and code.
+
+Keep it inline, no tools. Response can be moderately long but focused. Avoid re-explaining everything already given; reference.
+
+Let me also mention timeouts, HTTP error handling, and "typing" refresh.
+
+One more: if the user's AI is a local model (llama.cpp), mention where to swap: Llm.reply is the single seam.
+
+Let me write the final answer. Use code blocks. No file writes.
+
+I must ensure imports and types correct.
+
+Llm with history:
+
+import android.util.Log
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
+
+object Llm {
+    private const val BASE_URL = "https://api.openai.com/v1/chat/completions"
+    private const val MODEL = "gpt-4o-mini"
+    private const val API_KEY = "" // blank = disabled
+    private const val SYSTEM = "You are replying to WhatsApp messages on the owner's phone. Be brief and natural. Plain text, no markdown."
+    private const val MAX_TURNS = 12
+
+    private val history = ConcurrentHashMap<String, ArrayDeque<Pair<String, String>>>()
+
+    fun isEnabled() = API_KEY.isNotBlank()
+
+    fun reply(chatId: String, userText: String): String? {
+        if (!isEnabled()) return null
+        val turns = history.getOrPut(chatId) { ArrayDeque() }
+
+        val messages = JSONArray()
+        messages.put(JSONObject().put("role", "system").put("content", SYSTEM))
+        synchronized(turns) {
+            for ((role, content) in turns) {
+                messages.put(JSONObject().put("role", role).put("content", content))
+            }
+        }
+        messages.put(JSONObject().put("role", "user").put("content", userText))
+
+        val payload = JSONObject()
+            .put("model", MODEL)
+            .put("temperature", 0.6)
+            .put("max_tokens", 400)
+            .put("messages", messages)
+
+        val answer = post(payload) ?: return null
+        synchronized(turns) {
+            turns.addLast("user" to userText)
+            turns.addLast("assistant" to answer)
+            while (turns.size > MAX_TURNS) turns.removeFirst()
+        }
+        return answer
+    }
+
+    private fun post(payload: JSONObject): String? {
+        var conn: HttpURLConnection? = null
+        return try {
+            val c = (URL(BASE_URL).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"; connectTimeout = 15_000; readTimeout = 60_000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("Authorization", "Bearer $API_KEY")
+            }
+            conn = c
+            c.outputStream.use { it.write(payload.toString().toByteArray()) }
+            if (c.responseCode !in 200..299) {
+                Log.e("Llm", "HTTP ${c.responseCode}: " + (c.errorStream?.bufferedReader()?.use { it.readText() } ?: ""))
+                return null
+            }
+            JSONObject(c.inputStream.bufferedReader().use { it.readText() })
+                .optJSONArray("choices")?.optJSONObject(0)
+                ?.optJSONObject("message")?.optString("content")?.trim()
+        } catch (e: Exception) {
+            Log.e("Llm", "call failed", e); null
+        } finally { conn?.disconnect() }
+    }
+}
+
+Note: ArrayDeque in Kotlin stdlib vs java.util. Use java.util.ArrayDeque? Kotlin has ArrayDeque (kotlin.collections.ArrayDeque). Both fine. getOrPut on ConcurrentHashMap works. for ((role, content) in turns) works for ArrayDeque of Pair. turns.addLast("user" to userText) — Kotlin ArrayDeque has addLast. Fine. removeFirst(). Fine.
+
+But history.getOrPut on ConcurrentHashMap is not atomic (Kotlin extension uses get/put), but per-chat single io thread anyway. Fine.
+
+Now the handler:
+
+private fun handleIncoming(json: String) {
+    ...
+    if (type != "chat") return
+    if (body.isBlank()) return
+    online(true); seen(chatId); typingWhile(chatId)
+    try {
+        val answer = Llm.reply(chatId, body.trim())
+        typingDone(chatId)
+        if (!answer.isNullOrBlank()) sendText(chatId, answer, id)
+    } catch (e: Exception) {
+        typingDone(chatId)
+        Log.e(TAG, "reply failed", e)
+    }
+}
+
+But careful: Llm.reply blocking on io thread; typing refresh via ticker, good.
+
+sendText:
+
+private fun sendText(chatId: String, text: String, quotedId: String?) {
+    val js = "window.__waReply(${q(chatId)}, ${q(text)}, ${quotedId?.let(::q) ?: "null"})"
+    js(js) // careful naming conflict
+}
+
+I named the helper js(code). Calling js(js) is confusing. Rename to evalJs. I'll present final code consistently.
+
+Let me define:
+private fun evalJs(code: String) = runOnUiThread {
+    try { web.evaluateJavascript(code, null) } catch (_: Exception) {}
+}
+private fun q(s: String) = JSONObject.quote(s)
+
+sendText:
+private fun sendText(chatId: String, text: String, quotedId: String?) {
+    evalJs("window.__waReply && window.__waReply(${q(chatId)}, ${q(text)}, ${quotedId?.let { q(it) } ?: "null"})")
+}
+
+Good.
+
+Now "use your own AI" section:
+- If their AI is OpenAI-compatible: just set BASE_URL/MODEL/API_KEY.
+- If their AI is a custom endpoint: replace post() body/parse, or add a second function returning { "reply": "..." }.
+- If local on-device: llama.cpp JNI / MediaPipe LLM — keep reply() signature and call it instead.
+- If it's the repo's opencode bridge: you can't run opencode on Android; expose it as an HTTP endpoint on the PC and post to it.
+
+Also mention the reply is fully driven by the AI text; the Kotlin does not template anything.
+
+Also mention "how it replies" includes message chunking and error fallback.
+
+Let me write the answer now. Keep code accurate.
+
+One caveat: JSONObject.put chaining works (put returns JSONObject). Yes.
+
+JSONObject().put("role","system").put("content", SYSTEM) returns JSONObject. Good.
+
+messages.put(JSONObject) — JSONArray.put(Object). Good.
+
+ArrayDeque with Pair: for ((role, content) in turns) — destructuring Pair. Good.
+
+I'll present it. No tools needed.
+
+I should maybe explicitly answer "how it is using my AI" in one line: every inbound text goes to Llm.reply(chatId, body); that function is the only seam, and the return string goes straight back to the chat. Then code.
+
+Let me keep it tight-ish.
+One seam does it: every inbound text goes to `Llm.reply(chatId, text); whatever string it returns is sent straight back to that chat. Nothing is templated in Kotlin — your AI owns the reply text.
+The whole reply path
+web.whatsapp.com  Msg.on('add')
+   → AndroidWA.onMessage(json)          (JS bridge)
+   → io thread → handleIncoming()       (filter, seen, typing on)
+   → Llm.reply(chatId, body)            (YOUR AI – blocking HTTP/JNI)
+   → typing off → window.__waReply()    (chunk + send, quote original)
+1. The AI seam — Llm.kt (full, inline)
+import android.util.Log
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
+
+object Llm {
+    // Any OpenAI-compatible endpoint. Swap these 3 lines for your own AI.
+    private const val BASE_URL = "https://api.openai.com/v1/chat/completions"
+    private const val MODEL    = "gpt-4o-mini"
+    private const val API_KEY  = ""   // blank = no auto-reply
+
+    private const val SYSTEM =
+        "You are replying to WhatsApp messages on the owner's phone. " +
+        "Be brief and natural. Plain text only, no markdown."
+    private const val MAX_TURNS = 12
+
+    private val history = ConcurrentHashMap<String, ArrayDeque<Pair<String, String>>>()
+
+    fun isEnabled(): Boolean = API_KEY.isNotBlank()
+
+    /** Called on MainActivity's io executor, so blocking HTTP is fine. */
+    fun reply(chatId: String, userText: String): String? {
+        if (!isEnabled()) return null
+        val turns = history.getOrPut(chatId) { ArrayDeque() }
+
+        val messages = JSONArray()
+            .put(JSONObject().put("role", "system").put("content", SYSTEM))
+        synchronized(turns) {
+            for ((role, content) in turns) {
+                messages.put(JSONObject().put("role", role).put("content", content))
+            }
+        }
+        messages.put(JSONObject().put("role", "user").put("content", userText))
+
+        val payload = JSONObject()
+            .put("model", MODEL)
+            .put("temperature", 0.6)
+            .put("max_tokens", 400)
+            .put("messages", messages)
+
+        val answer = post(payload) ?: return null
+
+        synchronized(turns) {
+            turns.addLast("user" to userText)
+            turns.addLast("assistant" to answer)
+            while (turns.size > MAX_TURNS) turns.removeFirst()
+        }
+        return answer
+    }
+
+    private fun post(payload: JSONObject): String? {
+        var conn: HttpURLConnection? = null
+        return try {
+            val c = (URL(BASE_URL).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 15_000
+                readTimeout = 60_000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("Authorization", "Bearer $API_KEY")
+            }
+            conn = c
+            c.outputStream.use { it.write(payload.toString().toByteArray()) }
+
+            val code = c.responseCode
+            if (code !in 200..299) {
+                Log.e("Llm", "HTTP $code: " +
+                    (c.errorStream?.bufferedReader()?.use { it.readText() } ?: "").take(300))
+                return null
+            }
+            JSONObject(c.inputStream.bufferedReader().use { it.readText() })
+                .optJSONArray("choices")
+                ?.optJSONObject(0)
+                ?.optJSONObject("message")
+                ?.optString("content")
+                ?.trim()
+        } catch (e: Exception) {
+            Log.e("Llm", "AI call failed", e)
+            null
+        } finally {
+            conn?.disconnect()
+        }
+    }
+}
+Per-chat history is what makes it "remember" the conversation. Swap BASE_URL/MODEL/API_KEY and you're on Groq/OpenRouter/Ollama (http://10.0.2.2:11434/v1/chat/completions). If your AI is a custom endpoint, change only post()'s URL and the last JSON parse.
+2. The caller — handleIncoming reply tail
+private fun handleIncoming(json: String) {
+    val m = JSONObject(json)
+    val idObj = m.optJSONObject("id") ?: return
+    val id      = idObj.optString("_serialized").ifEmpty { idObj.optString("\$1") }
+    val fromMe  = idObj.optBoolean("fromMe")
+    val chatId  = idObj.optString("remote")
+    val type    = m.optString("type")
+    val body    = m.optString("body")
+
+    if (fromMe || id.isEmpty() || chatId.isEmpty()) return
+    if (chatId == "status@broadcast") return
+    if (!REPLY_TO_GROUPS && chatId.endsWith("@g.us")) return
+    if (seen.contains(id)) return
+    seen.add(id)
+
+    if (type != "chat" || body.isBlank()) return   // text only for now
+
+    evalJs("window.__waPresence && window.__waPresence(true)")
+    evalJs("window.__waSeen && window.__waSeen(${q(chatId)})")
+    typingWhile(chatId)
+
+    try {
+        val answer = Llm.reply(chatId, body.trim())   // <-- YOUR AI decides the reply
+        typingDone(chatId)
+        if (!answer.isNullOrBlank()) sendText(chatId, answer, id)
+    } catch (e: Exception) {
+        typingDone(chatId)
+        Log.e(TAG, "reply failed", e)
+    }
+}
+3. Sending the AI text back — chunk + quote
+Why chunk: one giant evaluateJavascript string can fail, and WhatsApp looks better split. This keeps order because it awaits each send.
+// add to wa_boot.js next to __waSend
+window.__waReply = async (chatId, text, quotedId, chunkSize = 4000) => {
+  const chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+  if (!chat) throw new Error('no chat ' + chatId);
+
+  const parts = [];
+  let rest = text;
+  while (rest.length > chunkSize) {
+    let cut = rest.lastIndexOf('\n', chunkSize);
+    if (cut < chunkSize * 0.5) cut = rest.lastIndexOf(' ', chunkSize);
+    if (cut < chunkSize * 0.5) cut = chunkSize;
+    parts.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^\s+/, '');
+  }
+  if (rest) parts.push(rest);
+
+  for (let i = 0; i < parts.length; i++) {
+    const opts = (i === 0 && quotedId) ? { quotedMessageId: quotedId } : {};
+    try {
+      await window.WWebJS.sendMessage(chat, parts[i], opts);
+    } catch (e) {
+      if (i !== 0 || !quotedId) throw e;         // quote failed -> retry plain
+      await window.WWebJS.sendMessage(chat, parts[i], {});
+    }
+  }
+};
+private fun evalJs(code: String) = runOnUiThread {
+    try { web.evaluateJavascript(code, null) } catch (_: Exception) {}
+}
+private fun q(s: String) = JSONObject.quote(s)
+
+private fun sendText(chatId: String, text: String, quotedId: String?) {
+    evalJs(
+        "window.__waReply && window.__waReply(${q(chatId)}, ${q(text)}, " +
+            (quotedId?.let { q(it) } ?: "null") + ")"
+    )
+}
+If "my AI" is your existing opencode bridge
+You can't run opencode on the phone, but you can keep the same behaviour by making Llm.post() hit your PC/server:
+private const val BASE_URL = "http://192.168.1.50:2785/bridge/reply" // your server
+// body: {"chatId":"...","text":"..."}  ->  response: {"reply":"..."}
+and parse JSONObject(resp).optString("reply") instead of choices[0].message.content. The Android side then looks identical: inbound text → HTTP → returned string → __waReply.
+For a truly on-device model, keep reply(chatId, userText): String? and call your llama.cpp/MediaPipe-LiteRT binding inside it — the rest of the app doesn't change.
+Want me to show the same seam for inbound images/stickers (download the media, base64 it into the AI prompt)? That's the next piece.

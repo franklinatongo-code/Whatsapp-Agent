@@ -1,0 +1,23 @@
+<resources>
+    <string name="app_name">ClawLink WA</string>
+    <string name="nav_link">Home</string>
+    <string name="nav_chats">Chats</string>
+    <string name="nav_ask_ai">Text AI</string>
+    <string name="nav_agent">AI</string>
+    <string name="nav_logs">Tools</string>
+    <string name="notif_channel_name">WhatsApp Channel Service</string>
+    <string name="notif_channel_desc">Maintains encrypted WhatsApp Multi-Device connection and AI agent runtime.</string>
+    <string name="cd_qr_code">WhatsApp device pairing QR code</string>
+    <string name="cd_custom_qr">Generated scannable QR code</string>
+    <string name="cd_brand_emblem">ClawLink WA emblem</string>
+    <string name="cd_send_message">Send WhatsApp message</string>
+    <string name="cd_attach_image">Attach photo from Photo Picker</string>
+    <string name="cd_attach_document">Attach document</string>
+    <string name="cd_voice_dictate">Voice transcribe input</string>
+    <string name="cd_speak_aloud">Read message aloud</string>
+    <string name="cd_refresh_models">Refresh NVIDIA NIM models</string>
+    <string name="cd_ai_avatar">ClawLink AI avatar</string>
+    <string name="cd_send_ai">Send message to AI assistant</string>
+    <string name="cd_attach_ai">Attach picture or file for AI</string>
+    <string name="tile_auto_reply_label">WA Auto-Reply</string>
+</resources>
